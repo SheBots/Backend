@@ -3,7 +3,8 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
-import { streamChat } from './src/providers/openaiAdapter.js';
+import { streamChat as streamChatOpenAI } from './src/providers/openaiAdapter.js';
+import { streamChat as streamChatGemini } from './src/providers/geminiAdapter.js';
 
 // Load environment variables
 dotenv.config();
@@ -18,6 +19,20 @@ const MODEL_API_KEY = process.env.MODEL_API_KEY;
 // PII redaction patterns
 const EMAIL_REGEX = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
 const PHONE_REGEX = /(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g;
+
+/**
+ * Get the streaming function for the configured provider
+ */
+function getStreamingProvider(provider) {
+  switch (provider.toLowerCase()) {
+    case 'openai':
+      return streamChatOpenAI;
+    case 'gemini':
+      return streamChatGemini;
+    default:
+      throw new Error(`Unsupported provider: ${provider}. Supported providers: openai, gemini`);
+  }
+}
 
 /**
  * Redact PII from text content
@@ -164,6 +179,9 @@ app.post('/api/chat', async (req, res) => {
     let tokensStreamed = 0;
 
     try {
+      // Get the appropriate streaming provider
+      const streamChat = getStreamingProvider(PROVIDER);
+      
       // Stream response
       for await (const token of streamChat({
         messages,
