@@ -5,6 +5,7 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import { streamChat as streamChatOpenAI } from './src/providers/openaiAdapter.js';
 import { streamChat as streamChatGemini } from './src/providers/geminiAdapter.js';
+import fetch from 'node-fetch';
 
 // Load environment variables
 dotenv.config();
@@ -117,6 +118,8 @@ app.use('/api', limiter);
 // Body parser
 app.use(express.json({ limit: '1mb' }));
 
+// RAG routes moved to separate RagService; Backend will call RAG via HTTP using RAG_URL/RAG_API_KEY
+
 // Health endpoint
 app.get('/api/health', (req, res) => {
   res.json({
@@ -147,6 +150,37 @@ app.post('/api/chat', async (req, res) => {
 
     // Validate request
     const { message, history } = validateChatRequest(req.body);
+    const useDocs = Boolean(req.body.useDocs === true || String(req.body.useDocs) === 'true');
+
+    // If RAG is enabled and useDocs=true, call the RAG service HTTP API to get top snippets
+    let preamble = null;
+    if (useDocs && (process.env.RAG_ENABLED || 'true') === 'true') {
+      try {
+        const k = Number(process.env.RAG_TOP_K || 5);
+        const ragUrl = process.env.RAG_URL || 'http://localhost:3001';
+        const apiKey = process.env.RAG_API_KEY;
+        const url = `${ragUrl.replace(/\/$/, '')}/api/search?q=${encodeURIComponent(message)}&k=${k}`;
+        const headers = { 'Accept': 'application/json' };
+        if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+        const resp = await fetch(url, { headers, timeout: 5000 });
+        if (resp.ok) {
+          const json = await resp.json();
+          const results = json.results || [];
+          if (results.length > 0) {
+            const snippets = results.map(r => {
+              const sanitized = String(r.text || '').replace(EMAIL_REGEX, '[redacted-email]').replace(PHONE_REGEX, '[redacted-phone]');
+              return `----\n${sanitized}\nSource: [${r.title || r.url}](${r.url})\n`;
+            }).join('\n');
+
+            preamble = `You are a helpful assistant. Prefer these snippets if relevant.\nCite as [Title](URL). If unsure, say so.\n\n${snippets}\n`;
+          }
+        } else {
+          console.warn('RAG service responded with', resp.status);
+        }
+      } catch (e) {
+        console.error('RAG service error', e.message);
+      }
+    }
 
     // Set SSE headers
     res.writeHead(200, {
@@ -162,12 +196,15 @@ app.post('/api/chat', async (req, res) => {
       ...history.map(msg => ({
         role: msg.role,
         content: redactPII(msg.content)
-      })),
-      {
-        role: 'user',
-        content: redactPII(message)
-      }
+      }))
     ];
+
+    // If we built a preamble, inject it as a system message to bias the model
+    if (preamble) {
+      messages.unshift({ role: 'system', content: preamble });
+    }
+
+    messages.push({ role: 'user', content: redactPII(message) });
 
     // Send start event
     res.write(`event: start\n`);
