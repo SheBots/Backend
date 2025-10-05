@@ -1,6 +1,12 @@
 fastapi==0.95.2
 uvicorn[standard]==0.22.0
+python-dotenv==1.0.0
+httpx==0.24.1
+transformers>=4.43.0
+torch>=2.0.0
+accelerate>=0.22.0
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
 transformers==4.42.0
-torch==2.2.2
-sentencepiece==0.1.99
+torch==2.8.0
 pydantic==1.10.11
