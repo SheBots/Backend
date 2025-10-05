@@ -1,8 +1,9 @@
-SheBots Backend (FastAPI + transformers)
+# SheBots Backend (FastAPI + transformers)
 
 Run a streaming SSE chat endpoint backed by a local transformers model.
 
 Setup
+
 1. Create and activate a virtualenv with Python 3.10+.
    python -m venv .venv
    .\.venv\Scripts\Activate.ps1
@@ -14,12 +15,14 @@ Run (development):
    uvicorn main:app --reload --port 8000
 
 Notes
+
 - The model specified by MODEL_ID can be large. CPU inference is slow. Use a quantized or smaller model for local runs.
 - SSE streaming endpoint: POST /api/chat (Content-Type: application/json). Accepts {message, history?, useDocs?} and returns text/event-stream.
 
 Curl example (no RAG):
-curl -N -H "Content-Type: application/json" -d '{"message":"Hello"}' http://localhost:8000/api/chat
-# SheBots Chatbot API
+curl -N -H "Content-Type: application/json" -d '{"message":"Hello"}' <http://localhost:8000/api/chat>
+
+SheBots Chatbot API
 
 A production-ready chatbot API with Server-Sent Events (SSE) streaming, built with Node.js and Express.
 
