@@ -2,6 +2,11 @@
 
 Run a streaming SSE chat endpoint backed by a local transformers model.
 
+Note: this repository now defaults to the Qwen chat model (`Qwen/Qwen1.5-1.8B-Chat`).
+To run that model locally you will need a CUDA-enabled GPU, recent `transformers` and `accelerate`,
+and a valid Hugging Face token if the model requires authentication. Override `MODEL_ID` in
+`.env` to use a different model (for local CPU-friendly testing, set `MODEL_ID=distilgpt2`).
+
 Setup
 
 1. Create and activate a virtualenv with Python 3.10+.
