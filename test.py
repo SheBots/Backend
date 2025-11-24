@@ -3,6 +3,23 @@
 # Lets you test /api/chat without the React frontend.
 
 import os
+from dotenv import load_dotenv
+import httpx
+
+load_dotenv()
+
+def quick_health_check():
+    base = os.getenv("TEST_BASE", "http://127.0.0.1:8000")
+    url = f"{base}/api/health"
+    try:
+        resp = httpx.get(url, timeout=5.0)
+        print("Status", resp.status_code)
+        print(resp.json())
+    except Exception as e:
+        print("Health check error:", e)
+
+if __name__ == "__main__":
+    quick_health_check()
 import sys
 import json
 import time
@@ -16,7 +33,7 @@ HEALTH_URL = f"{API_BASE}/api/health"
 # Conversation history in the same shape the backend expects
 history = []  # [{ "role": "user"|"assistant"|"system", "content": "..." }]
 
-use_docs = False  # toggle RAG usage from the terminal
+use_docs = True  # RAG forced ON for every query
 
 
 def print_banner():
@@ -124,12 +141,10 @@ def handle_command(cmd: str) -> bool:
     if cmd == "/quit":
         return False
     if cmd == "/rag on":
-        use_docs = True
-        print("RAG: ON (Use web snippets)")
+        print("RAG already ON (forced).")
         return True
     if cmd == "/rag off":
-        use_docs = False
-        print("RAG: OFF")
+        print("RAG cannot be turned off; forced ON.")
         return True
     if cmd == "/clear":
         history = []

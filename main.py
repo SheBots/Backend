@@ -1,197 +1,169 @@
-# main.py
-# FastAPI backend with SSE streaming + explicit startup checks for:
-# 1) Local model loading (Transformers)
-# 2) Optional RAG service health (if RAG_BASE_URL is set)
+# main.py — SheBots Backend (GPT-5.1 + Human-friendly RAG Behavior)
 
 import os
 import re
 import json
-import time
-import threading
 import logging
+import httpx
 from dotenv import load_dotenv
-from typing import List, Optional, Literal, Dict, Any, Generator
+from typing import List, Optional, Literal
 
-import torch
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    TextIteratorStreamer,
-)
+from pydantic import BaseModel
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+load_dotenv()
 
 # -----------------------------
-# Logging setup
+# Logging
 # -----------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-log = logging.getLogger("shebots-backend")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("backend")
 
 # -----------------------------
-# Config (env with safe defaults)
+# CONFIG
 # -----------------------------
-ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "http://localhost:5173")
-MODEL_ID = os.getenv("MODEL_ID", "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "160"))
+RAG_BASE_URL = os.getenv("RAG_BASE_URL", "http://127.0.0.1:8001")
+GPT_API_KEY = os.getenv("GPT_API_KEY")
+GPT_MODEL_NAME = os.getenv("GPT_MODEL_NAME", "gpt-5.1")
+
+USE_GPT_API = bool(GPT_API_KEY)
+
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "200"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.3"))
 TOP_P = float(os.getenv("TOP_P", "0.95"))
-RAG_BASE_URL = os.getenv("RAG_BASE_URL", "http://127.0.0.1:8001").rstrip("/")  # e.g., http://localhost:8080
 
-# Device & dtype (robust on CPU-only Windows too)
-HAS_CUDA = torch.cuda.is_available()
-DEVICE = "cuda" if HAS_CUDA else "cpu"
-PREF_DTYPE = os.getenv("TORCH_DTYPE", "float32").lower()
-if PREF_DTYPE in {"bf16", "bfloat16"} and HAS_CUDA and torch.cuda.is_bf16_supported():
-    DTYPE = torch.bfloat16
-elif PREF_DTYPE in {"fp16", "float16"} and HAS_CUDA:
-    DTYPE = torch.float16
-else:
-    DTYPE = torch.float32  # safest on CPU
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "6000"))
 
 # -----------------------------
-# App & CORS
+# FastAPI App
 # -----------------------------
-app = FastAPI(title="SheBots Backend (Transformers Streaming)")
+app = FastAPI(title="SheBots Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN],
-    allow_credentials=True,
+    allow_origins=[os.getenv("ALLOWED_ORIGIN", "*")],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------
-# Global state flags
-# -----------------------------
-MODEL_READY: bool = False
-MODEL_ERROR: Optional[str] = None
-RAG_READY: Optional[bool] = True  # None = not checked, True/False after check
-RAG_ERROR: Optional[str] = None
+MODEL_READY = False
+MODEL_ERROR = None
+RAG_READY = None
+RAG_ERROR = None
 
-tokenizer = None
-model = None
+gpt_client = None
 
 # -----------------------------
-# Small helpers
+# Helpers
 # -----------------------------
-def banner_line(ch="=", n=70) -> str:
-    return ch * n
+def redact(text: str):
+    text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[email]", text)
+    return re.sub(r"\+?\d[\d\- ]{8,}\d", "[phone]", text)
 
-def redact(text: str) -> str:
-    if not text:
-        return text
-    text = re.sub(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "[redacted-email]", text, flags=re.I)
-    text = re.sub(r"\b(\+?\d[\d \-]{8,}\d)\b", "[redacted-phone]", text)
-    return text
 
-def sse(event: Optional[str], data: Dict[str, Any]) -> str:
+def sse(event, data: dict):
     prefix = f"event: {event}\n" if event else ""
     return f"{prefix}data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-def build_messages(history: List[Dict[str, str]], user_text: str) -> List[Dict[str, str]]:
-    msgs: List[Dict[str, str]] = []
-    if not any(m.get("role") == "system" for m in history or []):
-        msgs.append({"role": "system", "content": "You are a helpful assistant."})
-    msgs.extend(history or [])
-    msgs.append({"role": "user", "content": user_text})
-    return msgs
 
-def check_rag_health(timeout=5.0):
-    """Ping RAG /rag/health if RAG_BASE_URL is defined. Sets RAG_READY & RAG_ERROR."""
+def reduce_rag_context(chunks, max_chars=MAX_CONTEXT_CHARS):
+    cleaned = []
+    seen = set()
+    total = 0
+
+    for c in chunks:
+        c = c.strip()
+        if not c or c in seen:
+            continue
+
+        if total + len(c) > max_chars:
+            break
+
+        cleaned.append(c)
+        seen.add(c)
+        total += len(c)
+
+    return cleaned
+
+
+def check_rag_health():
     global RAG_READY, RAG_ERROR
-    if not RAG_BASE_URL:
-        RAG_READY = None
-        RAG_ERROR = "RAG_BASE_URL not set"
-        return
     try:
-        import httpx  # optional; only needed if RAG is used
-    except Exception as e:
-        RAG_READY = False
-        RAG_ERROR = f"httpx not installed: {e}"
-        return
-    try:
-        url = f"{RAG_BASE_URL}/rag/health"
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.get(url)
-            if resp.status_code == 200:
-                data = resp.json()
-                RAG_READY = bool(data.get("ok"))
-                RAG_ERROR = None if RAG_READY else f"RAG unhealthy: {data}"
+        with httpx.Client(timeout=3.0) as c:
+            r = c.get(f"{RAG_BASE_URL}/rag/health")
+            if r.status_code == 200:
+                RAG_READY = r.json().get("ok", False)
+                RAG_ERROR = None
             else:
                 RAG_READY = False
-                RAG_ERROR = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                RAG_ERROR = f"HTTP {r.status_code}"
     except Exception as e:
         RAG_READY = False
         RAG_ERROR = str(e)
 
-def log_windows_symlink_tip():
-    # Help users on Windows who see HF cache symlink warnings
-    if os.name == "nt":
-        log.info(
-            "Windows tip: enable Developer Mode or run Python as Admin to allow "
-            "symlinks for the HuggingFace cache (saves disk space). "
-            "To silence the warning, set HF_HUB_DISABLE_SYMLINKS_WARNING=1."
-        )
+
+def fetch_rag_context(query: str, k: int = 5):
+    if not RAG_READY:
+        return []
+
+    url = f"{RAG_BASE_URL}/rag/search"
+    params = {"query": query, "k": k}
+
+    try:
+        with httpx.Client(timeout=6.0) as c:
+            r = c.get(url, params=params)
+            if r.status_code != 200:
+                r = c.post(url, json=params)
+
+            if r.status_code != 200:
+                return []
+
+            docs = []
+            for item in r.json().get("results", []):
+                txt = item.get("text") or item.get("content") or ""
+                if txt:
+                    docs.append(txt)
+
+            return docs
+
+    except:
+        return []
+
 
 # -----------------------------
-# Startup: load model and run checks
+# Startup
 # -----------------------------
 @app.on_event("startup")
-def _load_resources():
-    global tokenizer, model, MODEL_READY, MODEL_ERROR
+def _startup():
+    global MODEL_READY, MODEL_ERROR, gpt_client
 
-    print(banner_line())
-    print("SheBots Backend — Startup")
-    print(banner_line("-"))
-    print(f"Model: {MODEL_ID}")
-    print(f"Device: {DEVICE} | dtype: {DTYPE} | CUDA: {HAS_CUDA}")
-    print(f"RAG_BASE_URL: {RAG_BASE_URL or '(not set)'}")
-    print(banner_line("-"))
+    print("=" * 60)
+    print("Backend starting…")
+    print("=" * 60)
 
-    log_windows_symlink_tip()
-
-    t0 = time.time()
-    try:
-        # Load tokenizer & model ONCE
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-        # Use `dtype=` to avoid deprecation warning for torch_dtype
-        # device_map="auto" works with accelerate; safe on single CPU/GPU boxes
-        model_kwargs = dict(dtype=DTYPE, device_map="auto")
-        # Some older transformers use torch_dtype; keep a fallback if dtype unsupported
+    if USE_GPT_API:
         try:
-            loaded = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs)
-        except TypeError:
-            log.warning("`dtype` not supported by current transformers — falling back to torch_dtype.")
-            model_kwargs_fallback = dict(torch_dtype=DTYPE, device_map="auto")
-            loaded = AutoModelForCausalLM.from_pretrained(MODEL_ID, **model_kwargs_fallback)
-        model = loaded
+            gpt_client = OpenAI(api_key=GPT_API_KEY)
+            MODEL_READY = True
+            print("Using GPT API:", GPT_MODEL_NAME)
+        except Exception as e:
+            MODEL_READY = False
+            MODEL_ERROR = str(e)
 
-        MODEL_READY = True
-        MODEL_ERROR = None
-        dt = time.time() - t0
-        print(f"✅ Model loaded OK in {dt:.2f}s")
-    except Exception as e:
-        MODEL_READY = False
-        MODEL_ERROR = str(e)
-        print(f"❌ Model load FAILED: {MODEL_ERROR}")
-
-    # RAG check (non-fatal)
-    check_rag_health()
-    if RAG_READY is True:
-        print("✅ RAG health OK")
-    elif RAG_READY is False:
-        print(f"❌ RAG health FAIL: {RAG_ERROR}")
     else:
-        print("ℹ️  RAG not configured (skipped)")
+        MODEL_READY = True
 
-    print(banner_line())
+    check_rag_health()
+    print("RAG:", "OK" if RAG_READY else f"FAIL ({RAG_ERROR})")
+    print("=" * 60)
+
 
 # -----------------------------
 # Schemas
@@ -203,82 +175,108 @@ class Message(BaseModel):
     content: str
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., description="User's latest message")
-    history: Optional[List[Message]] = Field(default_factory=list)
-    useDocs: Optional[bool] = Field(default=False)
+    message: str
+    history: Optional[List[Message]] = []
+    useDocs: Optional[bool] = True
+
 
 # -----------------------------
-# Routes
+# Health
 # -----------------------------
 @app.get("/api/health")
 async def health():
     return {
-        "ok": bool(MODEL_READY),
-        "model": MODEL_ID,
-        "device": DEVICE,
-        "dtype": str(DTYPE).split(".")[-1],
-        "model_ready": MODEL_READY,
-        "model_error": MODEL_ERROR,
-        "rag_base_url": RAG_BASE_URL or None,
+        "ok": MODEL_READY,
+        "model": GPT_MODEL_NAME if USE_GPT_API else None,
         "rag_ready": RAG_READY,
         "rag_error": RAG_ERROR,
     }
 
+
+# -----------------------------
+# CHAT (SSE STREAMING)
+# -----------------------------
 @app.post("/api/chat")
-async def chat(body: ChatRequest, request: Request):
+async def chat(req: ChatRequest, request: Request):
+
     if not MODEL_READY:
-        return JSONResponse(
-            {"error": f"Model not ready: {MODEL_ERROR or 'Unknown error'}"},
-            status_code=503,
+        return JSONResponse({"error": MODEL_ERROR}, 503)
+
+    if not RAG_READY:
+        return JSONResponse({"error": "RAG service unavailable."}, 503)
+
+    text = req.message.strip()
+    if not text:
+        return JSONResponse({"error": "Empty message"}, 400)
+
+    # -----------------------------
+    # Fetch RAG context
+    # -----------------------------
+    rag_chunks = reduce_rag_context(fetch_rag_context(text))
+
+    if len(rag_chunks) == 0:
+        # FINAL FALLBACK — Completely missing context
+        fallback_message = (
+            "I couldn’t get enough information about this. "
+            "Please try checking the notice section of the website for further information."
         )
+        return JSONResponse({"assistant": fallback_message}, 200)
 
-    user_text = (body.message or "").strip()
-    if not user_text:
-        return JSONResponse({"error": "Message is required."}, status_code=400)
-    if len(user_text) > 2000:
-        return JSONResponse({"error": "Message too long (2000 chars max)."}, status_code=413)
+    # -----------------------------
+    # Build system prompt
+    # -----------------------------
+    context = "\n".join(f"- {c}" for c in rag_chunks)
 
-    # Warn if RAG requested but not healthy (non-fatal; still answer without RAG)
-    if body.useDocs and not RAG_READY:
-        log.warning(f"RAG requested but not ready: {RAG_ERROR}")
-
-    # Build messages and template
-    msgs = [m.dict() for m in (body.history or [])]
-    msgs = build_messages(msgs, redact(user_text))
-    prompt_text = tokenizer.apply_chat_template(
-        msgs, tokenize=False, add_generation_prompt=True
-    )
-    inputs = tokenizer([prompt_text], return_tensors="pt").to(DEVICE)
-
-    streamer = TextIteratorStreamer(
-        tokenizer, skip_special_tokens=True, skip_prompt=True
+    sysmsg = (
+        "You are a helpful academic assistant for the KNU Computer Science department.\n"
+        "You MUST use the following RAG information to answer the user's question as accurately as possible.\n"
+        "Even if the information is short, you should still generate a helpful answer.\n"
+        "If the RAG context clearly contains no related information, respond politely.\n\n"
+        f"RAG Information:\n{context}"
     )
 
-    gen_kwargs = dict(
-        **inputs,
-        streamer=streamer,
-        max_new_tokens=MAX_NEW_TOKENS,
-        do_sample=True,
-        temperature=TEMPERATURE,
-        top_p=TOP_P,
-        eos_token_id=tokenizer.eos_token_id,
-    )
+    messages = [{"role": "system", "content": sysmsg}]
+    for h in req.history:
+        messages.append({"role": h.role, "content": h.content})
+    messages.append({"role": "user", "content": redact(text)})
 
-    # Non-blocking generation
-    thread = threading.Thread(target=model.generate, kwargs=gen_kwargs)
-    thread.start()
-
-    async def event_stream() -> Generator[str, None, None]:
-        yield sse("start", {"model": MODEL_ID})
+    # -----------------------------
+    # GPT-5.1 Streaming
+    # -----------------------------
+    async def stream_gpt():
+        yield sse("start", {"model": GPT_MODEL_NAME})
         tokens = 0
+
         try:
-            for text in streamer:
-                tokens += len(text)
+            resp = gpt_client.chat.completions.create(
+                model=GPT_MODEL_NAME,
+                messages=messages,
+                stream=True,
+                max_completion_tokens=MAX_NEW_TOKENS,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+            )
+
+            for chunk in resp:
                 if await request.is_disconnected():
                     break
-                yield sse(None, {"token": text})
-            yield sse("end", {"tokensStreamed": tokens})
+
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    tokens += len(delta)
+                    yield sse(None, {"token": delta})
+
+            yield sse("end", {"tokens": tokens})
+
         except Exception as e:
             yield sse("error", {"error": str(e)})
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(stream_gpt(), media_type="text/event-stream")
+
+
+# -----------------------------
+# Run Server
+# -----------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")), reload=True)
