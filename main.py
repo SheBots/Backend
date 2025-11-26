@@ -39,7 +39,9 @@ MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "200"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.3"))
 TOP_P = float(os.getenv("TOP_P", "0.95"))
 
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "6000"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "15000"))
+TARGET_CHAR_MIN = int(os.getenv("TARGET_CHAR_MIN", "300"))
+TARGET_CHAR_MAX = int(os.getenv("TARGET_CHAR_MAX", "400"))
 
 # -----------------------------
 # FastAPI App
@@ -91,6 +93,28 @@ def reduce_rag_context(chunks, max_chars=MAX_CONTEXT_CHARS):
         total += len(c)
 
     return cleaned
+
+
+def looks_incomplete(text: str) -> bool:
+    """
+    Heuristic: consider incomplete if it doesn't end with common terminal punctuation
+    and has a dangling last sentence fragment.
+    """
+    if not text:
+        return False
+    trimmed = text.strip()
+    # Ends with a terminal punctuation?
+    if re.search(r"[.!?…]$", trimmed):
+        return False
+    # Ends with obvious cut markers or list starters
+    if re.search(r"(?:\b(?:and|or|but|because|so|which)\b$)|[-–:]$", trimmed, re.IGNORECASE):
+        return True
+    # Too short to judge? Treat as complete.
+    if len(trimmed) < 40:
+        return False
+    # Default: if last line seems truncated (no punctuation in last 100 chars)
+    last = trimmed[-120:]
+    return not re.search(r"[.!?]$", last)
 
 
 def check_rag_health():
@@ -229,10 +253,12 @@ async def chat(req: ChatRequest, request: Request):
 
     sysmsg = (
         "You are a helpful academic assistant for the KNU Computer Science department.\n"
-        "You MUST use the following RAG information to answer the user's question as accurately as possible.\n"
-        "Even if the information is short, you should still generate a helpful answer.\n"
-        "If the RAG context clearly contains no related information, respond politely.\n\n"
-        f"RAG Information:\n{context}"
+        "Use the provided information below to answer accurately, but DO NOT mention sources like 'RAG' or 'documents'.\n"
+        "When referencing the information, speak as yourself (e.g., 'According to my information...').\n"
+        "Adopt a polite, self-aware tone: if unsure, say 'I might be mistaken—based on my information...' and invite correction.\n"
+        "If the provided information clearly lacks relevant details, respond politely without claiming external retrieval.\n"
+        "Write your final answer in Korean and aim for a concise response of 300–400 characters.\n\n"
+        f"Information:\n{context}"
     )
 
     messages = [{"role": "system", "content": sysmsg}]
@@ -246,13 +272,14 @@ async def chat(req: ChatRequest, request: Request):
     async def stream_gpt():
         yield sse("start", {"model": GPT_MODEL_NAME})
         tokens = 0
+        full_text = []
 
         try:
             resp = gpt_client.chat.completions.create(
                 model=GPT_MODEL_NAME,
                 messages=messages,
                 stream=True,
-                max_completion_tokens=MAX_NEW_TOKENS,
+                max_completion_tokens=max(MAX_NEW_TOKENS, 600),
                 temperature=TEMPERATURE,
                 top_p=TOP_P,
             )
@@ -264,7 +291,48 @@ async def chat(req: ChatRequest, request: Request):
                 delta = chunk.choices[0].delta.content
                 if delta:
                     tokens += len(delta)
+                    full_text.append(delta)
                     yield sse(None, {"token": delta})
+            current = "".join(full_text)
+
+            # If looks incomplete, ask the model to continue and stream the remainder (non-streaming for simplicity)
+            if looks_incomplete(current):
+                continuation = gpt_client.chat.completions.create(
+                    model=GPT_MODEL_NAME,
+                    messages=messages + [
+                        {"role": "assistant", "content": current},
+                        {"role": "user", "content": "Please continue and finish your answer."},
+                    ],
+                    max_completion_tokens=256,
+                    temperature=TEMPERATURE,
+                    top_p=TOP_P,
+                    stream=False,
+                )
+                extra = continuation.choices[0].message.content or ""
+                if extra:
+                    tokens += len(extra)
+                    # Send the remainder as one token event
+                    yield sse(None, {"token": extra})
+                    current += extra
+
+            # If too long, rewrite concisely to target Korean character range
+            if len(current) > TARGET_CHAR_MAX:
+                rewrite = gpt_client.chat.completions.create(
+                    model=GPT_MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": "Rewrite the assistant message in Korean within 300–400 characters, preserving meaning and tone. Avoid mentioning sources; speak as 'my information'."},
+                        {"role": "user", "content": current},
+                    ],
+                    max_completion_tokens=300,
+                    temperature=max(0.2, TEMPERATURE - 0.1),
+                    top_p=TOP_P,
+                    stream=False,
+                )
+                concise = rewrite.choices[0].message.content or ""
+                if concise:
+                    yield sse("rewrite", {"original_len": len(current), "new_len": len(concise)})
+                    # Emit concise version (client can replace displayed text on 'rewrite' event)
+                    yield sse(None, {"token": concise})
 
             yield sse("end", {"tokens": tokens})
 
