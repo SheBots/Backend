@@ -2,3 +2,4 @@
 __pycache__/
 .env
 extra.txt
+shebots-rag-key.pem

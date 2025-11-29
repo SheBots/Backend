@@ -1,12 +1,17 @@
-fastapi
-uvicorn[standard]
-python-dotenv
-httpx
-transformers
-torch
-accelerate
-fastapi
-uvicorn
-torch
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.9.0+cpu
+
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
+python-dotenv==1.0.0
+httpx==0.24.1
+
+# If your backend uses transformers locally, keep these
+transformers==4.41.2
+tokenizers==0.19.1
+huggingface-hub==0.23.4
+numpy<2.0.0
+
 pydantic
 openai
+google-generativeai

@@ -1,39 +1,20 @@
-# test.py
-# Terminal chat client for the FastAPI backend (SSE).
-# Lets you test /api/chat without the React frontend.
+# test.py — Terminal chat client for the FastAPI backend (SSE)
 
 import os
+import sys
+import json
+import signal
 from dotenv import load_dotenv
-import httpx
+import requests
 
 load_dotenv()
 
-def quick_health_check():
-    base = os.getenv("TEST_BASE", "http://127.0.0.1:8000")
-    url = f"{base}/api/health"
-    try:
-        resp = httpx.get(url, timeout=5.0)
-        print("Status", resp.status_code)
-        print(resp.json())
-    except Exception as e:
-        print("Health check error:", e)
-
-if __name__ == "__main__":
-    quick_health_check()
-import sys
-import json
-import time
-import signal
-import requests
-
-API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+API_BASE = os.getenv("API_BASE", "http://3.27.241.187:8000")
 CHAT_URL = f"{API_BASE}/api/chat"
 HEALTH_URL = f"{API_BASE}/api/health"
 
-# Conversation history in the same shape the backend expects
-history = []  # [{ "role": "user"|"assistant"|"system", "content": "..." }]
-
-use_docs = True  # RAG forced ON for every query
+history = []
+use_docs = True
 
 
 def print_banner():
@@ -51,17 +32,13 @@ def check_health():
         r.raise_for_status()
         data = r.json()
         model = data.get("model", "unknown")
-        device = data.get("device", "unknown")
-        print(f"Health OK → model: {model} | device: {device}")
+        rag_ready = data.get("rag_ready", False)
+        print(f"Health OK → model: {model} | RAG: {rag_ready}")
     except Exception as e:
         print(f"Health check failed: {e}")
 
 
 def sse_chat(message: str, history_list, use_docs_flag: bool) -> str:
-    """
-    Sends a chat request and streams tokens from the backend.
-    Returns the full assistant response text.
-    """
     payload = {
         "message": message,
         "history": history_list,
@@ -72,7 +49,6 @@ def sse_chat(message: str, history_list, use_docs_flag: bool) -> str:
     try:
         with requests.post(CHAT_URL, json=payload, headers=headers, stream=True, timeout=60) as resp:
             if resp.status_code != 200:
-                # Non-stream (JSON error)
                 try:
                     err = resp.json()
                 except Exception:
@@ -80,7 +56,6 @@ def sse_chat(message: str, history_list, use_docs_flag: bool) -> str:
                 print(f"\n[HTTP {resp.status_code}] {err}")
                 return ""
 
-            # Parse SSE lines
             assistant_text = []
             current_event = None
 
@@ -90,7 +65,6 @@ def sse_chat(message: str, history_list, use_docs_flag: bool) -> str:
                     continue
                 line = raw.strip()
 
-                # Blank line = end of an SSE event block
                 if line == "":
                     current_event = None
                     continue
@@ -106,27 +80,21 @@ def sse_chat(message: str, history_list, use_docs_flag: bool) -> str:
                     try:
                         data = json.loads(data_str)
                     except json.JSONDecodeError:
-                        # Keep-alives or non-JSON payloads can occur
                         continue
 
                     if current_event == "start":
-                        # Optional: print meta info
-                        # print(f"\n[stream started: {data}]")
                         pass
                     elif current_event == "error":
                         print(f"\n[error] {data.get('error','unknown error')}")
                     elif current_event == "end":
-                        # Optional: print token count
-                        # print(f"\n[stream ended: {data}]")
                         pass
                     else:
-                        # Normal token chunk
                         token = data.get("token", "")
                         if token:
                             assistant_text.append(token)
                             print(token, end="", flush=True)
 
-            print()  # newline after stream ends
+            print()
             return "".join(assistant_text)
 
     except requests.exceptions.RequestException as e:
@@ -135,16 +103,17 @@ def sse_chat(message: str, history_list, use_docs_flag: bool) -> str:
 
 
 def handle_command(cmd: str) -> bool:
-    """Returns True if the caller should continue; False to quit."""
     global use_docs, history
 
     if cmd == "/quit":
         return False
     if cmd == "/rag on":
-        print("RAG already ON (forced).")
+        use_docs = True
+        print("RAG enabled.")
         return True
     if cmd == "/rag off":
-        print("RAG cannot be turned off; forced ON.")
+        use_docs = False
+        print("RAG disabled.")
         return True
     if cmd == "/clear":
         history = []
@@ -166,7 +135,6 @@ def main():
     print_banner()
     check_health()
 
-    # Graceful Ctrl+C
     signal.signal(signal.SIGINT, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
 
     while True:
@@ -185,18 +153,11 @@ def main():
             else:
                 continue
 
-        # Append user message to history
         history.append({"role": "user", "content": user})
-
-        # Call backend and stream
         reply = sse_chat(user, history_list=history, use_docs_flag=use_docs)
 
         if reply:
-            # Append assistant response to history
             history.append({"role": "assistant", "content": reply})
-        else:
-            # Remove the last user message if request failed (optional)
-            pass
 
 
 if __name__ == "__main__":
