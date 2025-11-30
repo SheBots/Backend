@@ -39,7 +39,7 @@ MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "200"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.3"))
 TOP_P = float(os.getenv("TOP_P", "0.95"))
 
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "15000"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "8000"))
 TARGET_CHAR_MIN = int(os.getenv("TARGET_CHAR_MIN", "300"))
 TARGET_CHAR_MAX = int(os.getenv("TARGET_CHAR_MAX", "400"))
 
@@ -95,26 +95,76 @@ def reduce_rag_context(chunks, max_chars=MAX_CONTEXT_CHARS):
     return cleaned
 
 
-def looks_incomplete(text: str) -> bool:
+def detect_language(text: str) -> Literal["ko", "en", "mixed"]:
     """
-    Heuristic: consider incomplete if it doesn't end with common terminal punctuation
-    and has a dangling last sentence fragment.
+    Detect if text is primarily Korean, English, or mixed.
     """
-    if not text:
-        return False
-    trimmed = text.strip()
-    # Ends with a terminal punctuation?
-    if re.search(r"[.!?…]$", trimmed):
-        return False
-    # Ends with obvious cut markers or list starters
-    if re.search(r"(?:\b(?:and|or|but|because|so|which)\b$)|[-–:]$", trimmed, re.IGNORECASE):
-        return True
-    # Too short to judge? Treat as complete.
-    if len(trimmed) < 40:
-        return False
-    # Default: if last line seems truncated (no punctuation in last 100 chars)
-    last = trimmed[-120:]
-    return not re.search(r"[.!?]$", last)
+    korean_chars = len(re.findall(r'[가-힣]', text))
+    english_chars = len(re.findall(r'[a-zA-Z]', text))
+    
+    total = korean_chars + english_chars
+    if total == 0:
+        return "en"
+    
+    korean_ratio = korean_chars / total
+    
+    if korean_ratio > 0.7:
+        return "ko"
+    elif korean_ratio < 0.3:
+        return "en"
+    else:
+        return "mixed"
+
+
+def detect_translation_request(text: str) -> Optional[str]:
+    """
+    Check if user explicitly requests translation or bilingual response.
+    Returns 'both', 'en', 'ko', or None
+    """
+    text_lower = text.lower()
+    
+    # Bilingual requests
+    if any(phrase in text_lower for phrase in [
+        "in both", "양쪽", "둘 다", "both korean and english", "english and korean",
+        "both languages", "두 언어"
+    ]):
+        return "both"
+    
+    # Translation to English
+    if any(phrase in text_lower for phrase in [
+        "translate to english", "in english", "영어로", "translate it to english",
+        "answer in english"
+    ]):
+        return "en"
+    
+    # Translation to Korean
+    if any(phrase in text_lower for phrase in [
+        "translate to korean", "in korean", "한국어로", "translate it to korean",
+        "answer in korean"
+    ]):
+        return "ko"
+    
+    return None
+
+
+async def translate_text(text: str, target_lang: str, gpt_client) -> str:
+    """
+    Translate text to target language using GPT.
+    """
+    try:
+        prompt = f"Translate the following text to {target_lang}. Only provide the translation, no explanations:\n\n{text}"
+        
+        response = gpt_client.chat.completions.create(
+            model=GPT_MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=800,
+            temperature=0.3,
+            stream=False,
+        )
+        
+        return response.choices[0].message.content or text
+    except:
+        return text
 
 
 def check_rag_health():
@@ -133,7 +183,7 @@ def check_rag_health():
         RAG_ERROR = str(e)
 
 
-def fetch_rag_context(query: str, k: int = 5):
+def fetch_rag_context(query: str, k: int = 3):
     if not RAG_READY:
         return []
 
@@ -202,6 +252,8 @@ class ChatRequest(BaseModel):
     message: str
     history: Optional[List[Message]] = []
     useDocs: Optional[bool] = True
+    language: Optional[Literal["ko", "en", "auto"]] = "auto"
+    context_provided: Optional[bool] = False  # Track if context was already sent
 
 
 # -----------------------------
@@ -234,32 +286,104 @@ async def chat(req: ChatRequest, request: Request):
         return JSONResponse({"error": "Empty message"}, 400)
 
     # -----------------------------
-    # Fetch RAG context
+    # Language Detection
     # -----------------------------
-    rag_chunks = reduce_rag_context(fetch_rag_context(text))
-
-    if len(rag_chunks) == 0:
-        # FINAL FALLBACK — Completely missing context
-        fallback_message = (
-            "I couldn’t get enough information about this. "
-            "Please try checking the notice section of the website for further information."
-        )
-        return JSONResponse({"assistant": fallback_message}, 200)
+    detected_lang = detect_language(text)
+    translation_req = detect_translation_request(text)
+    
+    # Determine response language
+    if req.language == "auto":
+        response_lang = detected_lang if detected_lang != "mixed" else "ko"
+    else:
+        response_lang = req.language
+    
+    # Override if explicit translation request
+    if translation_req:
+        response_lang = translation_req
 
     # -----------------------------
-    # Build system prompt
+    # Smart Context Management (only fetch if needed)
     # -----------------------------
-    context = "\n".join(f"- {c}" for c in rag_chunks)
+    # Only provide context on first message or if explicitly not provided before
+    provide_context = not req.context_provided or len(req.history) == 0
+    
+    if provide_context:
+        rag_chunks = reduce_rag_context(fetch_rag_context(text))
 
-    sysmsg = (
-        "You are a helpful academic assistant for the KNU Computer Science department.\n"
-        "Use the provided information below to answer accurately, but DO NOT mention sources like 'RAG' or 'documents'.\n"
-        "When referencing the information, speak as yourself (e.g., 'According to my information...').\n"
-        "Adopt a polite, self-aware tone: if unsure, say 'I might be mistaken—based on my information...' and invite correction.\n"
-        "If the provided information clearly lacks relevant details, respond politely without claiming external retrieval.\n"
-        "Write your final answer in Korean and aim for a concise response of 300–400 characters.\n\n"
-        f"Information:\n{context}"
-    )
+        if len(rag_chunks) == 0:
+            # FINAL FALLBACK — Completely missing context
+            fallback_message = (
+                "I couldn't get enough information about this. "
+                "Please try checking the notice section of the website for further information."
+            )
+            if response_lang == "ko":
+                fallback_message = "이에 대한 충분한 정보를 찾을 수 없습니다. 웹사이트의 공지사항을 확인해 주세요."
+            elif response_lang == "both":
+                fallback_message = (
+                    "**Korean:**\n이에 대한 충분한 정보를 찾을 수 없습니다. 웹사이트의 공지사항을 확인해 주세요.\n\n"
+                    "**English:**\nI couldn't get enough information about this. Please try checking the notice section of the website for further information."
+                )
+            
+            return JSONResponse({"assistant": fallback_message}, 200)
+
+        # Build context only when providing it
+        context = "\n".join(f"- {c}" for c in rag_chunks)
+    else:
+        context = None
+
+    # -----------------------------
+    # Build system prompt based on language and context availability
+    # -----------------------------
+    if response_lang == "ko" or (response_lang == "mixed" and detected_lang != "en"):
+        if provide_context:
+            sysmsg = (
+                "You are a helpful academic assistant for the KNU Computer Science department.\n"
+                "Use ONLY the provided information to answer. DO NOT mention sources.\n"
+                "**CRITICAL: Your answer must be 300-400 characters in Korean. Be direct and concise.**\n"
+                "Speak as yourself (e.g., '제 정보에 따르면...'). If unsure, say '제 정보가 틀릴 수 있습니다만...'.\n\n"
+                f"Information:\n{context}"
+            )
+        else:
+            sysmsg = (
+                "You are a helpful academic assistant for the KNU Computer Science department.\n"
+                "Use the information provided earlier in the conversation to answer.\n"
+                "**CRITICAL: Your answer must be 300-400 characters in Korean. Be direct and concise.**\n"
+                "Speak as yourself (e.g., '제 정보에 따르면...'). If unsure, say '제 정보가 틀릴 수 있습니다만...'.\n"
+            )
+    elif response_lang == "en":
+        if provide_context:
+            sysmsg = (
+                "You are a helpful academic assistant for the KNU Computer Science department.\n"
+                "Use ONLY the provided information to answer in English. DO NOT mention sources.\n"
+                "**CRITICAL: Your answer must be 150-200 words maximum. Be direct and concise.**\n"
+                "Speak as yourself (e.g., 'According to my information...'). If unsure, acknowledge it.\n\n"
+                f"Information:\n{context}"
+            )
+        else:
+            sysmsg = (
+                "You are a helpful academic assistant for the KNU Computer Science department.\n"
+                "Use the information provided earlier in the conversation to answer in English.\n"
+                "**CRITICAL: Your answer must be 150-200 words maximum. Be direct and concise.**\n"
+                "Speak as yourself (e.g., 'According to my information...'). If unsure, acknowledge it.\n"
+            )
+    else:  # both languages
+        if provide_context:
+            sysmsg = (
+                "You are a helpful academic assistant for the KNU Computer Science department.\n"
+                "Use ONLY the provided information to answer in BOTH Korean and English.\n"
+                "**CRITICAL: Format as:**\n"
+                "**Korean:** [300-400 characters max]\n\n**English:** [150-200 words max]\n\n"
+                "DO NOT mention sources. Be direct and concise.\n\n"
+                f"Information:\n{context}"
+            )
+        else:
+            sysmsg = (
+                "You are a helpful academic assistant for the KNU Computer Science department.\n"
+                "Use the information provided earlier to answer in BOTH Korean and English.\n"
+                "**CRITICAL: Format as:**\n"
+                "**Korean:** [300-400 characters max]\n\n**English:** [150-200 words max]\n\n"
+                "DO NOT mention sources. Be direct and concise.\n"
+            )
 
     messages = [{"role": "system", "content": sysmsg}]
     for h in req.history:
@@ -267,10 +391,10 @@ async def chat(req: ChatRequest, request: Request):
     messages.append({"role": "user", "content": redact(text)})
 
     # -----------------------------
-    # GPT-5.1 Streaming
+    # GPT Streaming (optimized - no continuation)
     # -----------------------------
     async def stream_gpt():
-        yield sse("start", {"model": GPT_MODEL_NAME})
+        yield sse("start", {"model": GPT_MODEL_NAME, "language": response_lang, "context_provided": provide_context})
         tokens = 0
         full_text = []
 
@@ -279,7 +403,7 @@ async def chat(req: ChatRequest, request: Request):
                 model=GPT_MODEL_NAME,
                 messages=messages,
                 stream=True,
-                max_completion_tokens=max(MAX_NEW_TOKENS, 600),
+                max_completion_tokens=max(MAX_NEW_TOKENS, 450 if response_lang == "both" else 350),
                 temperature=TEMPERATURE,
                 top_p=TOP_P,
             )
@@ -293,37 +417,28 @@ async def chat(req: ChatRequest, request: Request):
                     tokens += len(delta)
                     full_text.append(delta)
                     yield sse(None, {"token": delta})
+            
             current = "".join(full_text)
 
-            # If looks incomplete, ask the model to continue and stream the remainder (non-streaming for simplicity)
-            if looks_incomplete(current):
-                continuation = gpt_client.chat.completions.create(
-                    model=GPT_MODEL_NAME,
-                    messages=messages + [
-                        {"role": "assistant", "content": current},
-                        {"role": "user", "content": "Please continue and finish your answer."},
-                    ],
-                    max_completion_tokens=256,
-                    temperature=TEMPERATURE,
-                    top_p=TOP_P,
-                    stream=False,
+            # Length check adjusted for language - rewrite if too long
+            max_length = TARGET_CHAR_MAX if response_lang != "en" else 1200
+            if len(current) > max_length:
+                rewrite_instruction = (
+                    "Rewrite in Korean: 300-400 characters exactly"
+                    if response_lang == "ko"
+                    else "Rewrite in English: 150-200 words exactly"
+                    if response_lang == "en"
+                    else "Rewrite bilingual: Korean 300-400 chars, English 150-200 words"
                 )
-                extra = continuation.choices[0].message.content or ""
-                if extra:
-                    tokens += len(extra)
-                    # Send the remainder as one token event
-                    yield sse(None, {"token": extra})
-                    current += extra
-
-            # If too long, rewrite concisely to target Korean character range
-            if len(current) > TARGET_CHAR_MAX:
+                
+                # Only send the assistant's response to rewrite, not the full context
                 rewrite = gpt_client.chat.completions.create(
                     model=GPT_MODEL_NAME,
                     messages=[
-                        {"role": "system", "content": "Rewrite the assistant message in Korean within 300–400 characters, preserving meaning and tone. Avoid mentioning sources; speak as 'my information'."},
+                        {"role": "system", "content": f"{rewrite_instruction}. Keep meaning, avoid sources."},
                         {"role": "user", "content": current},
                     ],
-                    max_completion_tokens=300,
+                    max_completion_tokens=400 if response_lang == "both" else 250,
                     temperature=max(0.2, TEMPERATURE - 0.1),
                     top_p=TOP_P,
                     stream=False,
