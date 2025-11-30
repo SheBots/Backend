@@ -31,7 +31,7 @@ log = logging.getLogger("backend")
 # -----------------------------
 RAG_BASE_URL = os.getenv("RAG_BASE_URL", "http://127.0.0.1:8001")
 GPT_API_KEY = os.getenv("OPENAI_API_KEY")
-GPT_MODEL_NAME = os.getenv("GPT_MODEL_NAME", "gpt-5.1")
+GPT_MODEL_NAME = os.getenv("GPT_MODEL_NAME", "gpt-4.1")
 
 USE_GPT_API = bool(GPT_API_KEY)
 
