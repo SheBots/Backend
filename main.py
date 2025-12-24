@@ -40,8 +40,8 @@ TEMPERATURE = float(os.getenv("TEMPERATURE", "0.3"))
 TOP_P = float(os.getenv("TOP_P", "0.95"))
 
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "8000"))
-TARGET_CHAR_MIN = int(os.getenv("TARGET_CHAR_MIN", "300"))
-TARGET_CHAR_MAX = int(os.getenv("TARGET_CHAR_MAX", "400"))
+TARGET_CHAR_MIN = int(os.getenv("TARGET_CHAR_MIN", "200"))
+TARGET_CHAR_MAX = int(os.getenv("TARGET_CHAR_MAX", "300"))
 
 # -----------------------------
 # FastAPI App
@@ -339,7 +339,7 @@ async def chat(req: ChatRequest, request: Request):
             sysmsg = (
                 "You are a helpful academic assistant for the KNU Computer Science department.\n"
                 "Use ONLY the provided information to answer. DO NOT mention sources.\n"
-                "**CRITICAL: Your answer must be 300-400 characters in Korean. Be direct and concise.**\n"
+                "**CRITICAL: Your answer must be 200-300 characters in Korean. Be direct and concise.**\n"
                 "Speak as yourself (e.g., '제 정보에 따르면...'). If unsure, say '제 정보가 틀릴 수 있습니다만...'.\n\n"
                 f"Information:\n{context}"
             )
@@ -347,7 +347,7 @@ async def chat(req: ChatRequest, request: Request):
             sysmsg = (
                 "You are a helpful academic assistant for the KNU Computer Science department.\n"
                 "Use the information provided earlier in the conversation to answer.\n"
-                "**CRITICAL: Your answer must be 300-400 characters in Korean. Be direct and concise.**\n"
+                "**CRITICAL: Your answer must be 200-300 characters in Korean. Be direct and concise.**\n"
                 "Speak as yourself (e.g., '제 정보에 따르면...'). If unsure, say '제 정보가 틀릴 수 있습니다만...'.\n"
             )
     elif response_lang == "en":
@@ -355,7 +355,7 @@ async def chat(req: ChatRequest, request: Request):
             sysmsg = (
                 "You are a helpful academic assistant for the KNU Computer Science department.\n"
                 "Use ONLY the provided information to answer in English. DO NOT mention sources.\n"
-                "**CRITICAL: Your answer must be 150-200 words maximum. Be direct and concise.**\n"
+                "**CRITICAL: Your answer must be 100-130 words maximum. Be direct and concise.**\n"
                 "Speak as yourself (e.g., 'According to my information...'). If unsure, acknowledge it.\n\n"
                 f"Information:\n{context}"
             )
@@ -363,7 +363,7 @@ async def chat(req: ChatRequest, request: Request):
             sysmsg = (
                 "You are a helpful academic assistant for the KNU Computer Science department.\n"
                 "Use the information provided earlier in the conversation to answer in English.\n"
-                "**CRITICAL: Your answer must be 150-200 words maximum. Be direct and concise.**\n"
+                "**CRITICAL: Your answer must be 100-130 words maximum. Be direct and concise.**\n"
                 "Speak as yourself (e.g., 'According to my information...'). If unsure, acknowledge it.\n"
             )
     else:  # both languages
@@ -372,7 +372,7 @@ async def chat(req: ChatRequest, request: Request):
                 "You are a helpful academic assistant for the KNU Computer Science department.\n"
                 "Use ONLY the provided information to answer in BOTH Korean and English.\n"
                 "**CRITICAL: Format as:**\n"
-                "**Korean:** [300-400 characters max]\n\n**English:** [150-200 words max]\n\n"
+                "**Korean:** [200-300 characters max]\n\n**English:** [100-130 words max]\n\n"
                 "DO NOT mention sources. Be direct and concise.\n\n"
                 f"Information:\n{context}"
             )
@@ -381,7 +381,7 @@ async def chat(req: ChatRequest, request: Request):
                 "You are a helpful academic assistant for the KNU Computer Science department.\n"
                 "Use the information provided earlier to answer in BOTH Korean and English.\n"
                 "**CRITICAL: Format as:**\n"
-                "**Korean:** [300-400 characters max]\n\n**English:** [150-200 words max]\n\n"
+                "**Korean:** [200-300 characters max]\n\n**English:** [100-130 words max]\n\n"
                 "DO NOT mention sources. Be direct and concise.\n"
             )
 
@@ -421,14 +421,29 @@ async def chat(req: ChatRequest, request: Request):
             current = "".join(full_text)
 
             # Length check adjusted for language - rewrite if too long
-            max_length = TARGET_CHAR_MAX if response_lang != "en" else 1200
-            if len(current) > max_length:
+            should_rewrite = False
+            if response_lang == "ko":
+                # Over 300 characters (target 200-300 chars)
+                should_rewrite = len(current) > TARGET_CHAR_MAX
+            elif response_lang == "en":
+                # Over 130 words (target 100-130 words)
+                try:
+                    import re as _re  # local alias to ensure availability
+                    word_count = len(_re.findall(r"\b\w+\b", current))
+                except Exception:
+                    word_count = len(current.split())
+                should_rewrite = word_count > 130
+            else:
+                # Bilingual: rewrite only if excessively long to save tokens
+                should_rewrite = len(current) > 1500
+
+            if should_rewrite:
                 rewrite_instruction = (
-                    "Rewrite in Korean: 300-400 characters exactly"
+                    "Rewrite in Korean: 200-300 characters exactly"
                     if response_lang == "ko"
-                    else "Rewrite in English: 150-200 words exactly"
+                    else "Rewrite in English: 100-130 words exactly"
                     if response_lang == "en"
-                    else "Rewrite bilingual: Korean 300-400 chars, English 150-200 words"
+                    else "Rewrite bilingual: Korean 200-300 chars, English 100-130 words"
                 )
                 
                 # Only send the assistant's response to rewrite, not the full context
@@ -438,7 +453,7 @@ async def chat(req: ChatRequest, request: Request):
                         {"role": "system", "content": f"{rewrite_instruction}. Keep meaning, avoid sources."},
                         {"role": "user", "content": current},
                     ],
-                    max_completion_tokens=400 if response_lang == "both" else 250,
+                    max_completion_tokens=320 if response_lang == "both" else 220,
                     temperature=max(0.2, TEMPERATURE - 0.1),
                     top_p=TOP_P,
                     stream=False,
